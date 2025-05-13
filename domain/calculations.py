@@ -48,16 +48,68 @@ def calcular_recebiveis_empresa(params: SimulationParams) -> pd.Series:
 
 def distribuir_comissoes(params: SimulationParams) -> pd.DataFrame:
     """
-    Retorna um DataFrame com colunas:
-    ['Mes', 'Custo_Fixo_Total', 'Comissao_Gerente', 'Comissao_Supervisor',
-     'Comissao_Vendedor', 'TopUp_Vendedor'] e calcula:
-    - Custo fixo total por cargo
-    - Comissão de gerente, supervisor e vendedores com fracionamento
-    - Top-up do vendedor quando comissão < piso
+    Calcula custo fixo e distribui comissões de gerente, supervisor e vendedores,
+    incluindo top-up de piso mínimo.
+    Retorna DataFrame com índice 'Mes' e colunas:
+      ['Custo_Fixo_Total', 'Comissao_Gerente', 'Comissao_Supervisor',
+       'Comissao_Vendedor', 'TopUp_Vendedor', 'Total_Custo']
     """
-    # Implementar lógica de distribuição
-    # 1) Para cada mês, calcular produção e base de comissão
-    # 2) Fracionar comissao de gerente, supervisor e vendedor conforme regras
-    # 3) Aplicar piso mínimo ao vendedor e calcular top-up
-    # 4) Somar custo fixo + pagamentos de comissão
-    pass
+    meses = np.arange(1, 25)
+    producao = projetar_producao(params)
+
+    # 1) Custo fixo total por mês (independente de vendas)
+    custo_fixo_total = (
+        params.team.num_vendedores   * params.team.custo_vendedor_fixo +
+        params.team.num_supervisores * params.team.custo_supervisor_fixo +
+        params.team.num_gerentes     * params.team.custo_gerente_fixo
+    )
+
+    # 2) Bases de comissão (antes de fracionar)
+    comiss_gerente_bruta    = producao * params.rules.comissao_gerente
+    if params.team.num_supervisores > 0:
+        prod_por_sup        = producao / params.team.num_supervisores
+    else:
+        prod_por_sup        = pd.Series(0.0, index=meses)
+    comiss_supervisor_bruta = prod_por_sup * params.rules.comissao_supervisor
+
+    prod_por_vendedor      = producao / params.team.num_vendedores
+    # total bruto de comissão vendedores (antes do piso)
+    comiss_vendedor_bruta  = prod_por_vendedor * params.rules.comissao_vendedor * params.team.num_vendedores
+
+    # 3) função interna de fracionamento 4m/10m
+    def fracionar(serie_bruta: pd.Series) -> pd.Series:
+        fluxo = pd.Series(0.0, index=meses)
+        for t in meses:
+            cb   = serie_bruta.loc[t]
+            p4   = cb * params.rules.pct_4m / 4
+            p10  = cb * params.rules.pct_10m * 0.5 / 3
+            # parcelas 4 meses
+            for i in range(4):
+                m = t + i
+                if m <= 24: fluxo.loc[m] += p4
+            # parcelas 10 meses (3 meses)
+            for i in range(3):
+                m = t + i
+                if m <= 24: fluxo.loc[m] += p10
+        return fluxo
+
+    flux_ger  = fracionar(comiss_gerente_bruta)
+    flux_sup  = fracionar(comiss_supervisor_bruta)
+    flux_vend = fracionar(comiss_vendedor_bruta)
+
+    # 4) Top-up do piso para vendedores (pago no próprio mês de venda)
+    comiss_vend_unit = prod_por_vendedor * params.rules.comissao_vendedor
+    topup_unit       = (params.rules.salario_minimo_vendedor - comiss_vend_unit).clip(lower=0)
+    topup_total      = topup_unit * params.team.num_vendedores
+
+    # 5) Monta o DataFrame final
+    df = pd.DataFrame({
+        'Custo_Fixo_Total'   : custo_fixo_total,
+        'Comissao_Gerente'   : flux_ger,
+        'Comissao_Supervisor': flux_sup,
+        'Comissao_Vendedor'  : flux_vend,
+        'TopUp_Vendedor'     : topup_total
+    }, index=meses)
+    df['Total_Custo'] = df.sum(axis=1)
+    df.index.name = 'Mes'
+    return df
